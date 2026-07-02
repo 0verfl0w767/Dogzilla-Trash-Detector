@@ -1,0 +1,447 @@
+from picamera2 import Picamera2
+from ultralytics import YOLO
+from xgolib import XGO
+import time
+import cv2
+from IPython.display import display, Image as IPImage
+
+# =========================
+# NCNN 모델 경로
+# =========================
+MODEL_PATH = "/home/pi/A_TEST_CAN/best_ncnn_model_fine"
+
+# 네 모델 클래스:
+# 0: glass
+# 1: metal
+# 2: paper
+# 3: plastic
+TARGET_CLASSES = {"glass", "metal", "paper", "plastic"}
+
+# =========================
+# YOLO 설정
+# =========================
+CONF_THRES = 0.30
+IMG_SIZE = 416
+DETECT_EVERY = 2
+REQUIRED_HITS = 2
+COOLDOWN_SEC = 8
+MAX_DET = 5
+
+# =========================
+# 화면 출력 설정
+# =========================
+SHOW_CAMERA = True
+DISPLAY_EVERY = 1
+JPEG_QUALITY = 70
+
+# =========================
+# 오인식 완화 설정
+# =========================
+
+# 조명/음영 보정
+# 만약 플라스틱이 계속 유리처럼 보이면 False도 테스트해봐
+USE_PREPROCESS = True
+
+# 최종 클래스별 confidence 기준
+# glass는 빡세게, plastic은 조금 널널하게
+CLASS_THRESH = {
+    "glass": 0.65,
+    "metal": 0.18,
+    "paper": 0.30,
+    "plastic": 0.35,
+}
+
+# 선택 점수 보정
+# glass는 불리하게, metal/plastic은 조금 유리하게
+CLASS_BIAS = {
+    "glass": -0.20,
+    "metal": 0.12,
+    "paper": 0.00,
+    "plastic": 0.08,
+}
+
+# plastic으로 나왔는데 캔처럼 생기면 metal로 보정
+FORCE_PLASTIC_CANLIKE_TO_METAL = True
+PLASTIC_OVERRIDE_MAX_CONF = 0.75
+
+# glass로 나왔는데 confidence가 애매하면 plastic으로 보정
+FORCE_GLASS_WEAK_TO_PLASTIC = True
+GLASS_OVERRIDE_MAX_CONF = 0.75
+
+# 캔 비슷한 박스 세로/가로 비율
+CANLIKE_AR_MIN = 0.65
+CANLIKE_AR_MAX = 2.20
+
+# =========================
+# 몸 / 팔 위치 튜닝값
+# =========================
+BODY_Z_NORMAL = 100
+BODY_Z_LOW = 75
+
+ARM_READY_X = 100
+ARM_READY_Z = -30
+
+ARM_GRAB_X = 155
+ARM_GRAB_Z = -95
+
+ARM_LIFT_X = 80
+ARM_LIFT_Z = 80
+
+# 집게
+CLAW_OPEN = 0
+CLAW_CLOSE = 255
+
+# =========================
+# Dogzilla Lite 제어 객체
+# =========================
+dog = XGO(port="/dev/ttyAMA0", version="xgolite")
+
+# =========================
+# NCNN 모델 로드
+# =========================
+model = YOLO(MODEL_PATH)
+print("NCNN 모델 로드 완료:", model.names)
+
+# =========================
+# 카메라 시작
+# =========================
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(
+    main={"format": "RGB888", "size": (320, 240)}
+)
+picam2.configure(config)
+picam2.start()
+
+time.sleep(1)
+
+display_handle = None
+
+
+def preprocess_for_yolo(frame):
+    """
+    조명/음영 보정용 전처리
+    Picamera2 RGB frame 입력 -> RGB frame 출력
+    """
+    lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    )
+    l = clahe.apply(l)
+
+    lab = cv2.merge((l, a, b))
+    out = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+    blur = cv2.GaussianBlur(out, (0, 0), 1.0)
+    out = cv2.addWeighted(out, 1.25, blur, -0.25, 0)
+
+    return out
+
+
+def show_frame(frame, detections=None, best_target=None, infer_time=0.0, detect_hits=0):
+    """
+    주피터에서 카메라 화면 표시
+    """
+    global display_handle
+
+    if not SHOW_CAMERA:
+        return
+
+    display_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+    if detections is None:
+        detections = []
+
+    for det in detections:
+        x1, y1, x2, y2 = det["box"]
+        name = det["name"]
+        raw_name = det["raw_name"]
+        conf = det["conf"]
+        note = det.get("note", "")
+
+        thickness = 3 if best_target is not None and det == best_target else 2
+
+        cv2.rectangle(
+            display_frame,
+            (x1, y1),
+            (x2, y2),
+            (0, 255, 0),
+            thickness
+        )
+
+        if note:
+            label = f"{name} {conf:.2f} ({note})"
+        else:
+            label = f"{name} {conf:.2f}"
+
+        cv2.putText(
+            display_frame,
+            label,
+            (x1, max(y1 - 8, 15)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 255, 0),
+            2
+        )
+
+        if raw_name != name:
+            raw_label = f"raw: {raw_name}"
+            cv2.putText(
+                display_frame,
+                raw_label,
+                (x1, min(y2 + 16, display_frame.shape[0] - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (0, 255, 255),
+                1
+            )
+
+    status = f"hits: {detect_hits}/{REQUIRED_HITS} | infer: {infer_time:.3f}s"
+
+    cv2.putText(
+        display_frame,
+        status,
+        (10, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2
+    )
+
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+    ok, jpg = cv2.imencode(".jpg", display_frame, encode_param)
+
+    if not ok:
+        return
+
+    img = IPImage(data=jpg.tobytes())
+
+    if display_handle is None:
+        display_handle = display(img, display_id=True)
+    else:
+        display_handle.update(img)
+
+
+def grab_object(target_name="object"):
+    print(f"{target_name} 감지됨 -> 집게 동작 시작")
+
+    try:
+        dog.stop()
+        time.sleep(0.2)
+
+        dog.arm_mode(0)
+        time.sleep(0.3)
+
+        dog.translation('z', BODY_Z_LOW)
+        time.sleep(0.8)
+
+        dog.attitude('p', 15)
+        time.sleep(0.5)
+
+        dog.claw(CLAW_OPEN)
+        time.sleep(0.7)
+
+        dog.arm(ARM_READY_X, ARM_READY_Z)
+        time.sleep(0.8)
+
+        dog.arm(ARM_GRAB_X, ARM_GRAB_Z)
+        time.sleep(1.0)
+
+        dog.claw(CLAW_CLOSE)
+        time.sleep(0.8)
+
+        dog.arm(ARM_LIFT_X, ARM_LIFT_Z)
+        time.sleep(1.0)
+
+        dog.attitude('p', 0)
+        time.sleep(0.5)
+
+        dog.translation('z', BODY_Z_NORMAL)
+        time.sleep(0.8)
+
+        print("집게 동작 완료")
+
+    except Exception as e:
+        print("집게 동작 중 오류:", e)
+
+
+def detect_target(frame):
+    """
+    YOLO 탐지 + 클래스 보정
+    """
+
+    if USE_PREPROCESS:
+        input_frame = preprocess_for_yolo(frame)
+    else:
+        input_frame = frame
+
+    # 일단 낮은 conf로 후보를 넓게 받고,
+    # 아래에서 클래스별 threshold와 보정을 직접 적용함
+    base_conf = min(CLASS_THRESH.values())
+
+    results = model(
+        input_frame,
+        conf=base_conf,
+        imgsz=IMG_SIZE,
+        max_det=MAX_DET,
+        iou=0.70,
+        verbose=False
+    )
+
+    best_target = None
+    best_score = -999.0
+    detections = []
+
+    for r in results:
+        for box in r.boxes:
+            cls_id = int(box.cls[0])
+            raw_name = str(model.names[cls_id]).strip().lower()
+            conf = float(box.conf[0])
+
+            if raw_name not in TARGET_CLASSES:
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            w = max(x2 - x1, 1)
+            h = max(y2 - y1, 1)
+            aspect = h / w
+
+            name = raw_name
+            note = ""
+
+            # 1. plastic으로 나왔는데 캔처럼 생긴 경우 metal로 보정
+            if (
+                FORCE_PLASTIC_CANLIKE_TO_METAL
+                and raw_name == "plastic"
+                and conf <= PLASTIC_OVERRIDE_MAX_CONF
+                and CANLIKE_AR_MIN <= aspect <= CANLIKE_AR_MAX
+            ):
+                name = "metal"
+                note = "plastic->metal"
+
+            # 2. glass로 나왔는데 confidence가 애매하면 plastic으로 보정
+            # 이 부분 때문에 plastic이 glass로 잡히는 문제를 완화함
+            if (
+                FORCE_GLASS_WEAK_TO_PLASTIC
+                and raw_name == "glass"
+                and conf <= GLASS_OVERRIDE_MAX_CONF
+            ):
+                name = "plastic"
+                note = "glass->plastic"
+
+            # 보정 후 최종 클래스 기준으로 confidence 필터
+            final_thresh = CLASS_THRESH.get(name, CONF_THRES)
+
+            if conf < final_thresh:
+                continue
+
+            score = conf + CLASS_BIAS.get(name, 0.0)
+
+            det = {
+                "name": name,
+                "raw_name": raw_name,
+                "conf": conf,
+                "score": score,
+                "box": (x1, y1, x2, y2),
+                "aspect": aspect,
+                "note": note
+            }
+
+            detections.append(det)
+
+            if score > best_score:
+                best_score = score
+                best_target = det
+
+    return best_target, detections
+
+
+frame_count = 0
+detect_hits = 0
+last_grab_time = 0
+last_target = None
+last_detections = []
+last_infer_time = 0.0
+
+try:
+    print("NCNN 재활용 쓰레기 탐지 시작")
+    print("대상 클래스:", TARGET_CLASSES)
+    print("조명/음영 보정:", USE_PREPROCESS)
+    print("plastic -> metal 보정:", FORCE_PLASTIC_CANLIKE_TO_METAL)
+    print("glass -> plastic 보정:", FORCE_GLASS_WEAK_TO_PLASTIC)
+
+    while True:
+        frame = picam2.capture_array()
+        frame_count += 1
+
+        if frame_count % DETECT_EVERY == 0:
+            start_time = time.time()
+
+            target, detections = detect_target(frame)
+
+            infer_time = time.time() - start_time
+
+            last_target = target
+            last_detections = detections
+            last_infer_time = infer_time
+
+            if target is not None:
+                detect_hits += 1
+
+                print(
+                    f"감지 {detect_hits}/{REQUIRED_HITS}: "
+                    f"{target['name']} "
+                    f"raw={target['raw_name']} "
+                    f"conf={target['conf']:.2f} "
+                    f"score={target['score']:.2f} "
+                    f"aspect={target['aspect']:.2f} "
+                    f"{target['note']} "
+                    f"box={target['box']} "
+                    f"infer={infer_time:.3f}s"
+                )
+
+            else:
+                detect_hits = 0
+                last_target = None
+                last_detections = []
+
+            now = time.time()
+
+            if detect_hits >= REQUIRED_HITS and (now - last_grab_time) > COOLDOWN_SEC:
+                if last_target is not None:
+                    grab_object(last_target["name"])
+
+                last_grab_time = now
+                detect_hits = 0
+                last_target = None
+                last_detections = []
+
+        if frame_count % DISPLAY_EVERY == 0:
+            show_frame(
+                frame,
+                detections=last_detections,
+                best_target=last_target,
+                infer_time=last_infer_time,
+                detect_hits=detect_hits
+            )
+
+        time.sleep(0.03)
+
+except KeyboardInterrupt:
+    print("탐지 종료")
+
+finally:
+    try:
+        dog.stop()
+        dog.attitude('p', 0)
+        dog.translation('z', BODY_Z_NORMAL)
+        dog.arm(ARM_LIFT_X, ARM_LIFT_Z)
+        dog.claw(CLAW_OPEN)
+    except:
+        pass
+
+    picam2.stop()
+    picam2.close()
+    print("카메라 종료 완료")
